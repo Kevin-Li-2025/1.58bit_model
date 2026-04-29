@@ -42,6 +42,20 @@ def main(log_level: str) -> None:
 
 
 @main.command()
+@click.option("--dataset", default="HuggingFaceFW/fineweb", help="HF dataset name")
+@click.option("--subset", default="sample-10BT", help="Dataset subset")
+@click.option("--output", required=True, help="Path to save the .bin file")
+@click.option("--max-tokens", default=1_000_000_000, type=int, help="Max tokens to download")
+def download(dataset, subset, output, max_tokens):
+    """Download and pre-tokenise a dataset for offline training."""
+    from titanbit.training.data import DatasetDownloader
+    
+    downloader = DatasetDownloader(dataset_name=dataset, subset=subset)
+    downloader.download_and_tokenize(output, max_tokens=max_tokens)
+    safe_echo(f"\nDone! You can now train using your config with train_data_path: {output}")
+
+
+@main.command()
 @click.option("--config", "-c", required=True, help="Path to YAML config file")
 @click.option("--resume", default="", help="Path to checkpoint to resume from")
 def train(config: str, resume: str) -> None:

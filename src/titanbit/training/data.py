@@ -422,6 +422,104 @@ def tokenize_and_save(
 # DataLoader factories
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Robust Data Downloader (Offline Pre-tokenization)
+# ---------------------------------------------------------------------------
+
+class DatasetDownloader:
+    """
+    Downloads and pre-tokenises a HF dataset into a local .bin file.
+    
+    This is the recommended approach for unstable networks. It downloads
+    data in chunks and saves to disk, so training can later run entirely 
+    offline using the high-performance MMapDataset.
+    """
+    
+    def __init__(
+        self,
+        dataset_name: str,
+        subset: str,
+        split: str = "train",
+        text_column: str = "text",
+        tokenizer_name: str = "tiktoken:gpt2",
+    ):
+        self.dataset_name = dataset_name
+        self.subset = subset
+        self.split = split
+        self.text_column = text_column
+        self.tokenizer_name = tokenizer_name
+
+    def download_and_tokenize(self, output_path: str, max_tokens: int = 1_000_000_000):
+        """Download and tokenize until max_tokens reached."""
+        from datasets import load_dataset
+        import tiktoken
+        from tqdm import tqdm
+
+        # Setup tokenizer
+        if self.tokenizer_name.startswith("tiktoken:"):
+            enc = tiktoken.get_encoding(self.tokenizer_name.split(":")[1])
+            encode = enc.encode_ordinary
+        else:
+            raise ValueError(f"Unsupported tokenizer: {self.tokenizer_name}")
+
+        logger.info("Downloading %s/%s -> %s", self.dataset_name, self.subset, output_path)
+        
+        # Load in streaming mode to download incrementally
+        ds = load_dataset(
+            self.dataset_name, 
+            self.subset, 
+            split=self.split, 
+            streaming=True,
+            trust_remote_code=True
+        )
+
+        tokens_consumed = 0
+        all_tokens = []
+        
+        pbar = tqdm(total=max_tokens, desc="Tokenising", unit="tok")
+        
+        try:
+            for example in ds:
+                text = example.get(self.text_column, "")
+                if not text: continue
+                
+                ids = encode(text)
+                all_tokens.extend(ids)
+                tokens_consumed += len(ids)
+                pbar.update(len(ids))
+                
+                if tokens_consumed >= max_tokens:
+                    break
+                    
+                # Periodic flush to disk if list gets too large
+                if len(all_tokens) > 100_000_000:
+                    self._append_to_bin(all_tokens, output_path)
+                    all_tokens = []
+        except Exception as e:
+            logger.error("Download interrupted: %s. Saving progress...", e)
+        finally:
+            if all_tokens:
+                self._append_to_bin(all_tokens, output_path)
+            pbar.close()
+            
+        logger.info("Successfully saved %s tokens to %s", f"{tokens_consumed:,}", output_path)
+        self._write_metadata(output_path, tokens_consumed)
+
+    def _append_to_bin(self, tokens: list[int], path: str):
+        arr = np.array(tokens, dtype=np.uint16)
+        with open(path, "ab") as f:
+            f.write(arr.tobytes())
+
+    def _write_metadata(self, path: str, count: int):
+        meta = {
+            "num_tokens": count,
+            "dtype": "uint16",
+            "tokenizer": self.tokenizer_name,
+        }
+        with open(path.replace(".bin", ".meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+
+
 def create_data_loaders(config: DataConfig) -> tuple[DataLoader, Optional[DataLoader]]:
     """
     Create train and validation DataLoaders.
