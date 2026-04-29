@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "titanbit"
+version = "0.1.0"
+description = "TitanBit — 1.58-bit LLM pretraining engine with custom Triton kernels"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Kevin", email = "kevin@titanbit.dev"},
+]
+keywords = ["llm", "bitnet", "1-bit", "pretraining", "triton", "quantization"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "rich>=13.0.0",
+    "tiktoken>=0.6.0",
+    "safetensors>=0.4.0",
+    "einops>=0.7.0",
+]
+
+[project.optional-dependencies]
+triton = [
+    "triton>=2.2.0",
+]
+eval = [
+    "lm-eval>=0.4.0",
+    "datasets>=2.16.0",
+    "transformers>=4.36.0",
+]
+flash = [
+    "flash-attn>=2.5.0",
+]
+wandb = [
+    "wandb>=0.16.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
+all = ["titanbit[eval,flash,dev]"]
+
+[project.scripts]
+titanbit = "titanbit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

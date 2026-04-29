@@ -1,0 +1,102 @@
+# ============================================================================
+# TitanBit — Default Configuration
+# ============================================================================
+# 1.3B parameter BitNet b1.58 model optimised for NVIDIA L20 (48GB)
+#
+# Memory budget:
+#   Weights (BF16):    ~2.6 GB
+#   Optimizer (AdamW):  ~5.2 GB (2 states × 4 bytes)
+#   Gradients:          ~2.6 GB
+#   Activations:        ~8-12 GB (seq=2048, batch=8)
+#   Total:              ~18-22 GB → 26 GB headroom on L20
+# ============================================================================
+
+# --- Model Architecture ---
+model:
+  hidden_size: 2048
+  num_layers: 24
+  num_heads: 32
+  num_kv_heads: 32            # 32 = MHA; set < 32 for GQA
+  vocab_size: 32000
+  max_seq_length: 2048
+  rope_theta: 10000.0
+
+  # BitNet quantisation
+  weight_bits: 1.58           # ternary {-1, 0, 1}
+  activation_bits: 8          # AbsMean quantisation
+
+  # Architecture choices
+  mlp_type: "swiglu"          # swiglu | gelu
+  norm_type: "rmsnorm"        # rmsnorm | layernorm
+  norm_eps: 1.0e-5
+
+  # Regularisation
+  dropout: 0.0
+  attention_dropout: 0.0
+  embedding_dropout: 0.0
+
+  # Misc
+  tie_word_embeddings: false
+  initializer_range: 0.02
+
+# --- Training ---
+training:
+  # Optimisation
+  learning_rate: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+
+  # Schedule
+  max_steps: 100000           # ~200B tokens at effective_batch=32k tokens/step
+  warmup_steps: 2000
+
+  # Batching
+  batch_size: 8               # micro batch (per forward pass)
+  gradient_accumulation_steps: 4  # effective batch = 8 × 4 = 32 sequences
+  # effective tokens/step = 32 × 2048 = 65,536
+
+  # Precision
+  dtype: "bfloat16"           # native BF16 on Ada Lovelace
+  compile_model: true         # torch.compile for kernel fusion
+
+  # Gradient checkpointing (trades compute for memory)
+  gradient_checkpointing: false  # enable if VRAM is tight
+
+  # Logging
+  log_interval: 10            # log every N steps
+  eval_interval: 500          # evaluate every N steps
+  eval_steps: 50              # number of eval batches
+  save_interval: 2000         # checkpoint every N steps
+
+  # Checkpointing
+  checkpoint_dir: "./checkpoints/bitnet-1.3B"
+  resume_from: ""             # path to checkpoint (empty = train from scratch)
+
+  # Weights & Biases
+  wandb_project: "titanbit"
+  wandb_run_name: ""          # auto-generated if empty
+  use_wandb: false
+
+  # Data pipeline
+  data:
+    train_data_path: "./data/train.bin"
+    val_data_path: "./data/val.bin"
+    seq_length: 2048
+    batch_size: 8
+    num_workers: 4
+    pin_memory: true
+    seed: 42
+
+  # Stability system
+  stability:
+    max_grad_norm: 1.0
+    spike_threshold: 5.0      # loss > 5× EMA triggers spike
+    ema_alpha: 0.99
+    min_steps_before_detection: 100
+    max_rollbacks: 3
+    lr_scale_after_recovery: 0.5
+    cooldown_steps: 50
+    stable_checkpoint_interval: 500
