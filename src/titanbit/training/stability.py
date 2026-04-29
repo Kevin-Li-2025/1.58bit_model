@@ -67,7 +67,20 @@ class StabilityConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> StabilityConfig:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        # Cast numeric fields to prevent YAML "type pollution" (string vs float/int)
+        typed_dict = {}
+        float_fields = ("max_grad_norm", "spike_threshold", "ema_alpha", "lr_scale_after_recovery")
+        int_fields = ("min_steps_before_detection", "max_rollbacks", "cooldown_steps", "stable_checkpoint_interval")
+        
+        for k, v in d.items():
+            if k in cls.__dataclass_fields__:
+                if k in float_fields:
+                    typed_dict[k] = float(v) if v is not None else v
+                elif k in int_fields:
+                    typed_dict[k] = int(v) if v is not None else v
+                else:
+                    typed_dict[k] = v
+        return cls(**typed_dict)
 
 
 class StabilityMonitor:

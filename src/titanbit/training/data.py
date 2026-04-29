@@ -87,7 +87,19 @@ class DataConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DataConfig:
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+        # Cast numeric fields to prevent YAML "type pollution" (string vs float/int)
+        typed_dict = {}
+        int_fields = ("seq_length", "batch_size", "num_workers", "max_epochs", "total_tokens", "vocab_size")
+        
+        for k, v in d.items():
+            if k in cls.__dataclass_fields__:
+                if k in int_fields:
+                    typed_dict[k] = int(v) if v is not None else v
+                elif k == "hf_val_fraction":
+                    typed_dict[k] = float(v) if v is not None else v
+                else:
+                    typed_dict[k] = v
+        return cls(**typed_dict)
 
 
 # ---------------------------------------------------------------------------

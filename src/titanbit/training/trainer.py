@@ -114,9 +114,23 @@ class TrainerConfig:
     def from_dict(cls, d: dict[str, Any]) -> TrainerConfig:
         data_cfg = DataConfig.from_dict(d.get("data", {}))
         stab_cfg = StabilityConfig.from_dict(d.get("stability", {}))
-        filtered = {k: v for k, v in d.items()
-                    if k in cls.__dataclass_fields__ and k not in ("data", "stability")}
-        return cls(**filtered, data=data_cfg, stability=stab_cfg)
+        
+        # Cast numeric fields to prevent string vs float issues from YAML
+        typed_dict = {}
+        float_fields = ("learning_rate", "min_lr", "weight_decay", "beta1", "beta2", "max_grad_norm")
+        int_fields = ("max_steps", "warmup_steps", "batch_size", "gradient_accumulation_steps", 
+                      "log_interval", "eval_interval", "eval_steps", "save_interval", "keep_last_n_checkpoints")
+        
+        for k, v in d.items():
+            if k in cls.__dataclass_fields__ and k not in ("data", "stability"):
+                if k in float_fields:
+                    typed_dict[k] = float(v) if v is not None else v
+                elif k in int_fields:
+                    typed_dict[k] = int(v) if v is not None else v
+                else:
+                    typed_dict[k] = v
+                    
+        return cls(**typed_dict, data=data_cfg, stability=stab_cfg)
 
     @classmethod
     def from_yaml(cls, path: str) -> TrainerConfig:
