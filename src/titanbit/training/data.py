@@ -278,6 +278,7 @@ class HFStreamingDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         from datasets import load_dataset
+        import time
 
         # Worker sharding
         worker_info = torch.utils.data.get_worker_info()
@@ -285,48 +286,71 @@ class HFStreamingDataset(IterableDataset):
         num_workers = worker_info.num_workers if worker_info else 1
 
         tokenize = self._get_tokenizer()
+        max_retries = 5
+        retry_delay = 5  # seconds
 
         for epoch in range(self.max_epochs):
             if epoch > 0:
                 logger.info("HFStreaming: starting epoch %d/%d", epoch + 1, self.max_epochs)
 
-            # Load with streaming
-            ds = load_dataset(
-                self.dataset_name,
-                self.subset,
-                split=self.split,
-                streaming=True,
-                trust_remote_code=True,
-            )
+            success = False
+            attempt = 0
+            
+            while not success and attempt < max_retries:
+                try:
+                    # Load with streaming
+                    ds = load_dataset(
+                        self.dataset_name,
+                        self.subset,
+                        split=self.split,
+                        streaming=True,
+                        trust_remote_code=True,
+                    )
 
-            # Shuffle with a buffer
-            ds = ds.shuffle(seed=self.seed + epoch, buffer_size=10_000)
+                    # Shuffle with a buffer
+                    ds = ds.shuffle(seed=self.seed + epoch + attempt, buffer_size=10_000)
 
-            # Token buffer for document packing
-            buffer: list[int] = []
-            chunk_size = self.seq_length + 1
+                    # Token buffer for document packing
+                    buffer: list[int] = []
+                    chunk_size = self.seq_length + 1
 
-            for i, example in enumerate(ds):
-                # Shard across workers
-                if i % num_workers != worker_id:
-                    continue
+                    for i, example in enumerate(ds):
+                        # Shard across workers
+                        if i % num_workers != worker_id:
+                            continue
 
-                text = example.get(self.text_column, "")
-                if not text or len(text.strip()) < 50:
-                    continue
+                        text = example.get(self.text_column, "")
+                        if not text or len(text.strip()) < 50:
+                            continue
 
-                tokens = tokenize(text)
-                buffer.extend(tokens)
+                        tokens = tokenize(text)
+                        buffer.extend(tokens)
 
-                # Yield complete sequences from the buffer
-                while len(buffer) >= chunk_size:
-                    chunk = buffer[:chunk_size]
-                    buffer = buffer[chunk_size:]
+                        # Yield complete sequences from the buffer
+                        while len(buffer) >= chunk_size:
+                            chunk = buffer[:chunk_size]
+                            buffer = buffer[chunk_size:]
 
-                    arr = np.array(chunk, dtype=np.int64)
-                    x = torch.from_numpy(arr[:-1])
-                    y = torch.from_numpy(arr[1:])
-                    yield {"input_ids": x, "labels": y}
+                            arr = np.array(chunk, dtype=np.int64)
+                            x = torch.from_numpy(arr[:-1])
+                            y = torch.from_numpy(arr[1:])
+                            yield {"input_ids": x, "labels": y}
+                    
+                    success = True # Completed the dataset successfully
+                
+                except Exception as e:
+                    attempt += 1
+                    logger.error(
+                        "🌐 Network error during streaming (attempt %d/%d): %s. "
+                        "Retrying in %d seconds...", 
+                        attempt, max_retries, e, retry_delay
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2 # Exponential backoff
+            
+            if not success:
+                logger.critical("❌ Failed to stream data after %d attempts. Stopping.", max_retries)
+                break
 
 
 # ---------------------------------------------------------------------------
