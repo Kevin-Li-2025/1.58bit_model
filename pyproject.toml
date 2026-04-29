@@ -48,13 +48,17 @@ flash = [
 wandb = [
     "wandb>=0.16.0",
 ]
+streaming = [
+    "datasets>=2.16.0",
+    "huggingface_hub>=0.20.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "ruff>=0.1.0",
     "mypy>=1.7.0",
 ]
-all = ["titanbit[eval,flash,dev]"]
+all = ["titanbit[eval,flash,streaming,wandb,dev]"]
 
 [project.scripts]
 titanbit = "titanbit.cli:main"

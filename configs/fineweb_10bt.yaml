@@ -1,0 +1,123 @@
+# ================================================================
+# TitanBit — FineWeb-10BT Pretraining Configuration
+# ================================================================
+#
+# Model:    BitNet b1.58 (1.3B parameters)
+# Data:     HuggingFace FineWeb sample-10BT (~10B tokens)
+# Hardware: Single NVIDIA L20 (48GB)
+#
+# Training strategy:
+#   - Single epoch through the entire 10B-token corpus
+#   - No data repetition to prevent overfitting
+#   - Cosine LR decay to 10% of peak after warmup
+#   - Checkpoint rotation: keep only last 2 + best + final
+#   - Auto-resume: training restarts from latest checkpoint
+#
+# Expected:
+#   - ~305,000 steps to exhaust 10B tokens
+#   - ~80-120 hours on L20 (depending on throughput)
+#   - Final checkpoint: ~12 GB on disk
+#
+# To run:
+#   titanbit train --config configs/fineweb_10bt.yaml
+# ================================================================
+
+# --- Model Architecture ---
+model:
+  hidden_size: 2048
+  num_layers: 24
+  num_heads: 32
+  num_kv_heads: 32
+  vocab_size: 50257              # GPT-2 tokenizer (tiktoken:gpt2)
+  max_seq_length: 2048
+  weight_bits: 1.58
+  activation_bits: 8
+  dropout: 0.0
+  attention_dropout: 0.0
+  embedding_dropout: 0.0
+  norm_eps: 1e-5
+  norm_type: rmsnorm
+  mlp_type: swiglu
+  tie_word_embeddings: false
+  initializer_range: 0.02
+  use_cache: true
+
+# --- Training ---
+training:
+  # Optimisation
+  learning_rate: 3e-4             # peak LR (lower than standard — ternary is more sensitive)
+  min_lr: 3e-5                    # 10% of peak — cosine decays here
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 1.0
+
+  # Schedule
+  # 10B tokens / (16 effective batch * 2048 seq) ≈ 305,175 steps
+  # We set max_steps slightly higher than needed — data exhaustion
+  # will trigger a clean stop before overfitting
+  max_steps: 320000
+  warmup_steps: 2000
+
+  # Batching
+  # micro_batch=4 × grad_accum=4 = 16 effective
+  # tokens_per_step = 16 × 2048 = 32,768
+  batch_size: 4
+  gradient_accumulation_steps: 4
+
+  # Precision
+  dtype: bfloat16
+  compile_model: true
+
+  # Logging
+  log_interval: 10
+  eval_interval: 1000
+  eval_steps: 50
+  save_interval: 5000             # save every 5K steps
+
+  # Checkpointing — the core of the "never lose progress" strategy
+  checkpoint_dir: ./checkpoints/fineweb-1.3B
+  keep_last_n_checkpoints: 2      # only keep last 2 step checkpoints
+  auto_resume: true               # auto-detect and resume from latest
+  resume_from: ""                 # or specify explicit path
+
+  # W&B
+  wandb_project: titanbit
+  wandb_run_name: fineweb-1.3B-10bt
+  use_wandb: false                # set true when ready
+
+  # Memory optimisation
+  gradient_checkpointing: true    # saves ~30% VRAM at cost of ~20% speed
+
+  # Data
+  data:
+    # FineWeb streaming — no download/preprocessing needed
+    hf_dataset: HuggingFaceFW/fineweb
+    hf_subset: sample-10BT
+    hf_text_column: text
+    hf_split: train
+    hf_val_split: ""              # hold out from train automatically
+    hf_val_fraction: 0.001
+
+    # Tokenizer
+    tokenizer_name: tiktoken:gpt2
+    vocab_size: 50257
+
+    # Sequence
+    seq_length: 2048
+    batch_size: 4
+    num_workers: 4
+    pin_memory: true
+    seed: 42
+
+    # Anti-overfit: single pass through data
+    max_epochs: 1
+
+  # Stability
+  stability:
+    enabled: true
+    spike_threshold: 5.0
+    ema_alpha: 0.99
+    max_rollbacks: 10
+    stable_checkpoint_interval: 1000
+    lr_scale_after_recovery: 0.5

@@ -33,10 +33,12 @@ Key features:
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -90,6 +92,8 @@ class TrainerConfig:
 
     # Checkpointing
     checkpoint_dir: str = "./checkpoints"
+    keep_last_n_checkpoints: int = 2       # keep only last N step checkpoints (+ best + final)
+    auto_resume: bool = True               # auto-detect and resume from latest checkpoint
     resume_from: str = ""              # path to checkpoint to resume from
 
     # W&B
@@ -271,15 +275,26 @@ class Trainer:
         """
         Main training loop.
 
+        Supports:
+            - Auto-resume from latest checkpoint in checkpoint_dir
+            - Explicit resume via resume_from path
+            - Checkpoint rotation (keep last N + best + final)
+            - Data exhaustion detection (stops if data runs out)
+            - Epoch tracking to prevent overfitting
+
         Returns a dict with final training statistics.
         """
         cfg = self.config
         model = self.model
         optimizer = self.optimizer
 
-        # Resume from checkpoint if specified
+        # Resume logic: explicit > auto-detect > fresh start
         if cfg.resume_from and os.path.exists(cfg.resume_from):
             self._load_checkpoint(cfg.resume_from)
+        elif cfg.auto_resume:
+            latest = self._find_latest_checkpoint()
+            if latest:
+                self._load_checkpoint(latest)
 
         logger.info("=" * 70)
         logger.info("TitanBit Training")
@@ -287,13 +302,17 @@ class Trainer:
         logger.info("  Effective batch: %d", cfg.effective_batch_size)
         logger.info("  Max steps:       %d", cfg.max_steps)
         logger.info("  Warmup steps:    %d", cfg.warmup_steps)
-        logger.info("  Learning rate:   %.2e → %.2e", cfg.learning_rate, cfg.min_lr)
+        logger.info("  Learning rate:   %.2e -> %.2e", cfg.learning_rate, cfg.min_lr)
         logger.info("  Precision:       %s", cfg.dtype)
+        logger.info("  Checkpoint rotation: keep last %d", cfg.keep_last_n_checkpoints)
+        if self.global_step > 0:
+            logger.info("  Resumed from:    step %d (%s tokens)",
+                        self.global_step, f"{self.tokens_processed:,}")
         logger.info("=" * 70)
 
         self._train_start_time = time.monotonic()
         train_iter = iter(self.train_loader)
-        accumulated_loss = 0.0
+        data_exhausted = False
 
         while self.global_step < cfg.max_steps:
             # Set LR for this step
@@ -308,8 +327,14 @@ class Trainer:
                 try:
                     batch = next(train_iter)
                 except StopIteration:
-                    train_iter = iter(self.train_loader)
-                    batch = next(train_iter)
+                    # Data exhausted — this is the anti-overfit signal
+                    logger.warning(
+                        "Data exhausted at step %d (%s tokens). "
+                        "All data has been consumed — stopping to prevent overfitting.",
+                        self.global_step, f"{self.tokens_processed:,}",
+                    )
+                    data_exhausted = True
+                    break
 
                 input_ids = batch["input_ids"].to(self.device, non_blocking=True)
                 labels = batch["labels"].to(self.device, non_blocking=True)
@@ -326,6 +351,9 @@ class Trainer:
                     loss.backward()
 
                 micro_losses.append(loss.item() * cfg.gradient_accumulation_steps)
+
+            if data_exhausted:
+                break
 
             # Gradient clipping
             if self.scaler is not None:
@@ -366,9 +394,10 @@ class Trainer:
                 val_loss = self._evaluate()
                 self._log_eval(val_loss)
 
-            # Save checkpoint
+            # Save checkpoint (with rotation)
             if self.global_step % cfg.save_interval == 0:
                 self._save_checkpoint()
+                self._rotate_checkpoints()
 
             # Save stable state for rollback
             if self.global_step % cfg.stability.stable_checkpoint_interval == 0:
@@ -384,6 +413,7 @@ class Trainer:
             "elapsed_seconds": elapsed,
             "tokens_per_second": self.tokens_processed / elapsed if elapsed > 0 else 0,
             "best_val_loss": self.best_val_loss,
+            "data_exhausted": data_exhausted,
             "stability": self.stability.stats,
         }
 
@@ -392,6 +422,8 @@ class Trainer:
         logger.info("  Steps: %d | Tokens: %s", self.global_step, f"{self.tokens_processed:,}")
         logger.info("  Time: %.1f hours", elapsed / 3600)
         logger.info("  Throughput: %.0f tokens/sec", stats["tokens_per_second"])
+        if data_exhausted:
+            logger.info("  Data exhausted: YES (single epoch completed, no overfit risk)")
         logger.info("=" * 70)
 
         return stats
@@ -534,7 +566,65 @@ class Trainer:
             checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
         torch.save(checkpoint, path)
-        logger.info("💾 Checkpoint saved: %s (step %d)", path, self.global_step)
+        logger.info("Checkpoint saved: %s (step %d)", path, self.global_step)
+
+    def _rotate_checkpoints(self) -> None:
+        """
+        Keep only the last N step checkpoints + best + final.
+
+        This prevents disk from filling up during multi-day runs.
+        The 'best' and 'final' checkpoints are NEVER deleted.
+        """
+        keep_n = self.config.keep_last_n_checkpoints
+        if keep_n <= 0:
+            return  # rotation disabled
+
+        ckpt_dir = self.config.checkpoint_dir
+        pattern = os.path.join(ckpt_dir, "checkpoint_step_*.pt")
+        step_files = sorted(glob.glob(pattern))
+
+        # Keep only the most recent N
+        if len(step_files) > keep_n:
+            to_delete = step_files[:-keep_n]
+            for f in to_delete:
+                try:
+                    os.remove(f)
+                    logger.debug("Rotated old checkpoint: %s", f)
+                except OSError as e:
+                    logger.warning("Failed to delete checkpoint %s: %s", f, e)
+
+            remaining = len(step_files) - len(to_delete)
+            logger.info(
+                "Checkpoint rotation: deleted %d old, keeping %d recent",
+                len(to_delete), remaining,
+            )
+
+    def _find_latest_checkpoint(self) -> Optional[str]:
+        """
+        Auto-detect the latest step checkpoint in checkpoint_dir.
+
+        Searches for checkpoint_step_NNNNNNN.pt files and returns
+        the one with the highest step number.
+        """
+        ckpt_dir = self.config.checkpoint_dir
+        if not os.path.isdir(ckpt_dir):
+            return None
+
+        pattern = os.path.join(ckpt_dir, "checkpoint_step_*.pt")
+        step_files = sorted(glob.glob(pattern))
+
+        if step_files:
+            latest = step_files[-1]
+            logger.info("Auto-resume: found latest checkpoint %s", latest)
+            return latest
+
+        # Also check for final checkpoint
+        final_path = os.path.join(ckpt_dir, "checkpoint_final.pt")
+        if os.path.exists(final_path):
+            logger.info("Auto-resume: found final checkpoint %s", final_path)
+            return final_path
+
+        return None
 
     def _load_checkpoint(self, path: str) -> None:
         """Load training checkpoint and resume."""
