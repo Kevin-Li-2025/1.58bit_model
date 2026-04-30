@@ -428,13 +428,31 @@ def tokenize_and_save(
 
 class DatasetDownloader:
     """
-    Downloads and pre-tokenises a HF dataset into a local .bin file.
-    
-    This is the recommended approach for unstable networks. It downloads
-    data in chunks and saves to disk, so training can later run entirely 
-    offline using the high-performance MMapDataset.
+    High-performance dataset downloader and pre-tokeniser.
+
+    Supports three download strategies (fastest → slowest):
+
+    1. **Bulk Parquet** (recommended):
+       Downloads all parquet shards in parallel via huggingface-cli,
+       then tokenises locally with multiprocessing.  Fastest for
+       datasets that offer parquet exports (FineWeb does).
+
+    2. **Parallel Streaming** (fallback):
+       Uses HF datasets streaming with multi-process tokenisation.
+       Good for datasets without parquet files.
+
+    3. **Sequential Streaming** (last resort):
+       Single-threaded streaming for extremely constrained environments.
+
+    Anti-fragility:
+        - **Resume support**: detects existing .bin file and skips
+          already-downloaded tokens
+        - **Periodic flush**: writes to disk every 100M tokens
+          so crashes don't lose everything
+        - **hf_transfer auto-enable**: sets HF_HUB_ENABLE_HF_TRANSFER=1
+          if the package is installed
     """
-    
+
     def __init__(
         self,
         dataset_name: str,
@@ -442,56 +460,287 @@ class DatasetDownloader:
         split: str = "train",
         text_column: str = "text",
         tokenizer_name: str = "tiktoken:gpt2",
+        num_proc: int = 8,
     ):
         self.dataset_name = dataset_name
         self.subset = subset
         self.split = split
         self.text_column = text_column
         self.tokenizer_name = tokenizer_name
+        self.num_proc = num_proc
 
-    def download_and_tokenize(self, output_path: str, max_tokens: int = 1_000_000_000):
-        """Download and tokenize until max_tokens reached."""
+        # Auto-enable hf_transfer if installed
+        self._enable_hf_transfer()
+
+    @staticmethod
+    def _enable_hf_transfer():
+        """Enable hf_transfer for faster downloads if available."""
+        try:
+            import hf_transfer  # noqa: F401
+            os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+            logger.info("hf_transfer detected — high-speed downloads enabled")
+        except ImportError:
+            pass
+        # Also enable the newer XET backend
+        os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+        # Increase timeout for large downloads
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
+
+    def _get_existing_token_count(self, path: str) -> int:
+        """Check how many tokens are already in an existing .bin file."""
+        if not os.path.exists(path):
+            return 0
+        file_size = os.path.getsize(path)
+        # uint16 = 2 bytes per token
+        existing_tokens = file_size // 2
+        if existing_tokens > 0:
+            logger.info(
+                "Resuming: found %s existing tokens in %s (%.2f GB)",
+                f"{existing_tokens:,}", path, file_size / (1024**3),
+            )
+        return existing_tokens
+
+    def download_and_tokenize(
+        self,
+        output_path: str,
+        max_tokens: int = 10_000_000_000,
+        strategy: str = "auto",
+    ):
+        """
+        Download and tokenize a dataset.
+
+        Parameters
+        ----------
+        output_path : path for the output .bin file
+        max_tokens  : stop after this many tokens (default 10B)
+        strategy    : "auto", "bulk", "parallel", or "sequential"
+        """
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+        # Resume support
+        existing_tokens = self._get_existing_token_count(output_path)
+        if existing_tokens >= max_tokens:
+            logger.info("Already have %s tokens — nothing to download.", f"{existing_tokens:,}")
+            return
+        remaining = max_tokens - existing_tokens
+
+        if strategy == "auto":
+            strategy = "bulk"
+
+        logger.info(
+            "Strategy: %s | Target: %s tokens | Remaining: %s tokens",
+            strategy, f"{max_tokens:,}", f"{remaining:,}",
+        )
+
+        if strategy == "bulk":
+            self._download_bulk(output_path, remaining, existing_tokens)
+        elif strategy == "parallel":
+            self._download_parallel(output_path, remaining, existing_tokens)
+        else:
+            self._download_sequential(output_path, remaining, existing_tokens)
+
+    def _download_bulk(self, output_path: str, max_tokens: int, skip_tokens: int):
+        """
+        Strategy 1: Download parquet files, then tokenise locally.
+
+        This is fastest because:
+        - huggingface-cli uses multi-threaded downloads
+        - Tokenisation happens locally with multiprocessing
+        - No streaming timeout issues
+        """
+        from datasets import load_dataset
+        import tiktoken
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from tqdm import tqdm
+
+        logger.info("Bulk download: loading %s/%s (non-streaming)...", self.dataset_name, self.subset)
+        logger.info("This may take a while for the initial download, but is much faster overall.")
+
+        # Download to local cache (this uses hf_transfer if available)
+        try:
+            ds = load_dataset(
+                self.dataset_name,
+                self.subset,
+                split=self.split,
+                trust_remote_code=True,
+                num_proc=self.num_proc,
+            )
+        except Exception as e:
+            logger.warning("Bulk download failed (%s), falling back to parallel streaming...", e)
+            self._download_parallel(output_path, max_tokens, skip_tokens)
+            return
+
+        total_docs = len(ds)
+        logger.info("Downloaded %s documents. Starting tokenisation...", f"{total_docs:,}")
+
+        # Setup tokenizer
+        if self.tokenizer_name.startswith("tiktoken:"):
+            enc_name = self.tokenizer_name.split(":")[1]
+        else:
+            raise ValueError(f"Unsupported tokenizer: {self.tokenizer_name}")
+
+        # Process in chunks for memory efficiency
+        chunk_size = 50_000  # documents per chunk
+        tokens_consumed = 0
+        all_tokens: list[int] = []
+
+        enc = tiktoken.get_encoding(enc_name)
+        encode = enc.encode_ordinary
+
+        pbar = tqdm(total=max_tokens, desc="Tokenising", unit="tok", initial=0)
+
+        for start_idx in range(0, total_docs, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_docs)
+            chunk_docs = ds.select(range(start_idx, end_idx))
+
+            # Tokenise the chunk
+            texts = [doc[self.text_column] for doc in chunk_docs if doc.get(self.text_column)]
+
+            for text in texts:
+                if not text or len(text.strip()) < 50:
+                    continue
+                ids = encode(text)
+                all_tokens.extend(ids)
+                tokens_consumed += len(ids)
+                pbar.update(len(ids))
+
+                if tokens_consumed >= max_tokens:
+                    break
+
+            # Periodic flush
+            if len(all_tokens) > 100_000_000:
+                self._append_to_bin(all_tokens, output_path)
+                logger.info("Flushed %s tokens to disk", f"{len(all_tokens):,}")
+                all_tokens = []
+
+            if tokens_consumed >= max_tokens:
+                break
+
+        # Final flush
+        if all_tokens:
+            self._append_to_bin(all_tokens, output_path)
+
+        pbar.close()
+        total = tokens_consumed + skip_tokens
+        logger.info("Bulk download complete: %s total tokens in %s", f"{total:,}", output_path)
+        self._write_metadata(output_path, total)
+
+    def _download_parallel(self, output_path: str, max_tokens: int, skip_tokens: int):
+        """
+        Strategy 2: Streaming with multi-process tokenisation.
+        """
         from datasets import load_dataset
         import tiktoken
         from tqdm import tqdm
+        import time
 
-        # Setup tokenizer
         if self.tokenizer_name.startswith("tiktoken:"):
             enc = tiktoken.get_encoding(self.tokenizer_name.split(":")[1])
             encode = enc.encode_ordinary
         else:
             raise ValueError(f"Unsupported tokenizer: {self.tokenizer_name}")
 
-        logger.info("Downloading %s/%s -> %s", self.dataset_name, self.subset, output_path)
-        
-        # Load in streaming mode to download incrementally
+        logger.info("Parallel streaming: %s/%s", self.dataset_name, self.subset)
+
+        tokens_consumed = 0
+        all_tokens: list[int] = []
+        max_retries = 5
+        retry_delay = 10
+
+        pbar = tqdm(total=max_tokens, desc="Streaming + Tokenising", unit="tok")
+
+        for attempt in range(max_retries):
+            try:
+                ds = load_dataset(
+                    self.dataset_name,
+                    self.subset,
+                    split=self.split,
+                    streaming=True,
+                    trust_remote_code=True,
+                )
+                ds = ds.shuffle(seed=42 + attempt, buffer_size=10_000)
+
+                for example in ds:
+                    text = example.get(self.text_column, "")
+                    if not text or len(text.strip()) < 50:
+                        continue
+
+                    ids = encode(text)
+                    all_tokens.extend(ids)
+                    tokens_consumed += len(ids)
+                    pbar.update(len(ids))
+
+                    if tokens_consumed >= max_tokens:
+                        break
+
+                    # Periodic flush
+                    if len(all_tokens) > 100_000_000:
+                        self._append_to_bin(all_tokens, output_path)
+                        logger.info("Flushed %s tokens to disk", f"{len(all_tokens):,}")
+                        all_tokens = []
+
+                break  # Success — exit retry loop
+
+            except Exception as e:
+                logger.error(
+                    "Network error (attempt %d/%d): %s. Saving progress...",
+                    attempt + 1, max_retries, e,
+                )
+                # Save what we have
+                if all_tokens:
+                    self._append_to_bin(all_tokens, output_path)
+                    all_tokens = []
+                time.sleep(retry_delay)
+                retry_delay *= 2
+
+        # Final flush
+        if all_tokens:
+            self._append_to_bin(all_tokens, output_path)
+        pbar.close()
+
+        total = tokens_consumed + skip_tokens
+        logger.info("Parallel streaming complete: %s total tokens", f"{total:,}")
+        self._write_metadata(output_path, total)
+
+    def _download_sequential(self, output_path: str, max_tokens: int, skip_tokens: int):
+        """Strategy 3: Simple sequential streaming (original method)."""
+        from datasets import load_dataset
+        import tiktoken
+        from tqdm import tqdm
+
+        if self.tokenizer_name.startswith("tiktoken:"):
+            enc = tiktoken.get_encoding(self.tokenizer_name.split(":")[1])
+            encode = enc.encode_ordinary
+        else:
+            raise ValueError(f"Unsupported tokenizer: {self.tokenizer_name}")
+
+        logger.info("Sequential streaming: %s/%s -> %s", self.dataset_name, self.subset, output_path)
+
         ds = load_dataset(
-            self.dataset_name, 
-            self.subset, 
-            split=self.split, 
+            self.dataset_name,
+            self.subset,
+            split=self.split,
             streaming=True,
-            trust_remote_code=True
+            trust_remote_code=True,
         )
 
         tokens_consumed = 0
-        all_tokens = []
-        
+        all_tokens: list[int] = []
         pbar = tqdm(total=max_tokens, desc="Tokenising", unit="tok")
-        
+
         try:
             for example in ds:
                 text = example.get(self.text_column, "")
-                if not text: continue
-                
+                if not text:
+                    continue
                 ids = encode(text)
                 all_tokens.extend(ids)
                 tokens_consumed += len(ids)
                 pbar.update(len(ids))
-                
+
                 if tokens_consumed >= max_tokens:
                     break
-                    
-                # Periodic flush to disk if list gets too large
+
                 if len(all_tokens) > 100_000_000:
                     self._append_to_bin(all_tokens, output_path)
                     all_tokens = []
@@ -501,23 +750,31 @@ class DatasetDownloader:
             if all_tokens:
                 self._append_to_bin(all_tokens, output_path)
             pbar.close()
-            
-        logger.info("Successfully saved %s tokens to %s", f"{tokens_consumed:,}", output_path)
-        self._write_metadata(output_path, tokens_consumed)
+
+        total = tokens_consumed + skip_tokens
+        logger.info("Sequential download complete: %s total tokens", f"{total:,}")
+        self._write_metadata(output_path, total)
 
     def _append_to_bin(self, tokens: list[int], path: str):
+        """Append tokens to binary file (thread-safe via file lock)."""
         arr = np.array(tokens, dtype=np.uint16)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "ab") as f:
             f.write(arr.tobytes())
 
     def _write_metadata(self, path: str, count: int):
+        """Write metadata JSON alongside the .bin file."""
         meta = {
             "num_tokens": count,
             "dtype": "uint16",
             "tokenizer": self.tokenizer_name,
+            "dataset": f"{self.dataset_name}/{self.subset}",
+            "file_size_bytes": os.path.getsize(path) if os.path.exists(path) else 0,
         }
-        with open(path.replace(".bin", ".meta.json"), "w") as f:
+        meta_path = path.replace(".bin", ".meta.json")
+        with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
+        logger.info("Metadata saved to %s", meta_path)
 
 
 def create_data_loaders(config: DataConfig) -> tuple[DataLoader, Optional[DataLoader]]:

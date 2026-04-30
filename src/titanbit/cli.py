@@ -45,14 +45,36 @@ def main(log_level: str) -> None:
 @click.option("--dataset", default="HuggingFaceFW/fineweb", help="HF dataset name")
 @click.option("--subset", default="sample-10BT", help="Dataset subset")
 @click.option("--output", required=True, help="Path to save the .bin file")
-@click.option("--max-tokens", default=1_000_000_000, type=int, help="Max tokens to download")
-def download(dataset, subset, output, max_tokens):
-    """Download and pre-tokenise a dataset for offline training."""
+@click.option("--max-tokens", default=10_000_000_000, type=int, help="Max tokens to download (default: 10B)")
+@click.option("--strategy", default="auto", type=click.Choice(["auto", "bulk", "parallel", "sequential"]),
+              help="Download strategy: bulk (fastest), parallel, sequential")
+@click.option("--num-proc", default=8, type=int, help="Number of parallel workers")
+def download(dataset, subset, output, max_tokens, strategy, num_proc):
+    """Download and pre-tokenise a dataset for offline training.
+
+    \b
+    Speed tips:
+      1. pip install hf_transfer    (3-5x faster downloads)
+      2. Use --strategy bulk        (downloads all files first, then tokenises)
+      3. Use --num-proc 16          (more CPU workers for tokenisation)
+
+    \b
+    Examples:
+      titanbit download --output ./data/fineweb.bin
+      titanbit download --output ./data/fineweb.bin --strategy bulk --num-proc 16
+      titanbit download --dataset HuggingFaceFW/fineweb --subset sample-10BT --output ./data/fw10bt.bin
+    """
     from titanbit.training.data import DatasetDownloader
-    
-    downloader = DatasetDownloader(dataset_name=dataset, subset=subset)
-    downloader.download_and_tokenize(output, max_tokens=max_tokens)
-    safe_echo(f"\nDone! You can now train using your config with train_data_path: {output}")
+
+    safe_echo(f"Downloading {dataset}/{subset} -> {output}")
+    safe_echo(f"  Strategy: {strategy} | Workers: {num_proc} | Max tokens: {max_tokens:,}")
+
+    downloader = DatasetDownloader(
+        dataset_name=dataset, subset=subset, num_proc=num_proc
+    )
+    downloader.download_and_tokenize(output, max_tokens=max_tokens, strategy=strategy)
+    safe_echo(f"\nDone! Train with: titanbit train --config configs/fineweb_10bt.yaml")
+    safe_echo(f"  (set train_data_path: {output} in your config)")
 
 
 @main.command()
