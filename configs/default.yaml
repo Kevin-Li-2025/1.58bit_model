@@ -1,7 +1,8 @@
 # ============================================================================
 # TitanBit — Default Configuration
 # ============================================================================
-# 1.3B parameter BitNet b1.58 model optimised for NVIDIA L20 (48GB)
+# 1.3B parameter BitNet b1.58 model on FULL FineWeb-Edu (1.3T tokens)
+# Optimised for NVIDIA L20 (48GB)
 #
 # Memory budget (OOM-safe config):
 #   Weights (BF16):    ~2.6 GB
@@ -82,16 +83,19 @@ training:
   wandb_run_name: ""          # auto-generated if empty
   use_wandb: false
 
-  # Data pipeline
+  # Data pipeline — FULL FineWeb-Edu (1.3T tokens)
+  # Pre-download with: python scripts/download_fineweb_edu.py all -o ./data -w 16
   data:
-    train_data_path: "./data/train.bin"
+    train_data_path: "./data/train.bin"        # offline mmap (produced by download script)
     val_data_path: "./data/val.bin"
+    hf_dataset: ""                              # empty = use mmap mode (recommended)
+    hf_subset: "default"                        # full dataset, not sample-10BT
     seq_length: 2048
-    batch_size: 4                   # must match training.batch_size
+    batch_size: 4                               # must match training.batch_size
     num_workers: 4
     pin_memory: true
     seed: 42
-    max_epochs: 1               # single pass — no overfitting
+    max_epochs: 1                               # single pass — no overfitting
 
   # Stability system
   stability:
