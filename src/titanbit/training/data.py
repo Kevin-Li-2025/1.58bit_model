@@ -304,7 +304,7 @@ class HFStreamingDataset(IterableDataset):
                         self.subset,
                         split=self.split,
                         streaming=True,
-                        trust_remote_code=True,
+                        trust_remote_code=False,
                     )
 
                     # Shuffle with a buffer
@@ -562,7 +562,7 @@ class DatasetDownloader:
                 self.dataset_name,
                 self.subset,
                 split=self.split,
-                trust_remote_code=True,
+                trust_remote_code=False,
                 num_proc=self.num_proc,
             )
         except Exception as e:
@@ -656,7 +656,7 @@ class DatasetDownloader:
                     self.subset,
                     split=self.split,
                     streaming=True,
-                    trust_remote_code=True,
+                    trust_remote_code=False,
                 )
                 ds = ds.shuffle(seed=42 + attempt, buffer_size=10_000)
 
@@ -721,7 +721,7 @@ class DatasetDownloader:
             self.subset,
             split=self.split,
             streaming=True,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
 
         tokens_consumed = 0

@@ -3,12 +3,12 @@
 # ============================================================================
 # 1.3B parameter BitNet b1.58 model optimised for NVIDIA L20 (48GB)
 #
-# Memory budget:
+# Memory budget (OOM-safe config):
 #   Weights (BF16):    ~2.6 GB
 #   Optimizer (AdamW):  ~5.2 GB (2 states × 4 bytes)
 #   Gradients:          ~2.6 GB
-#   Activations:        ~8-12 GB (seq=2048, batch=8)
-#   Total:              ~18-22 GB → 26 GB headroom on L20
+#   Activations:        ~4-6 GB (seq=2048, batch=4, grad_ckpt=on)
+#   Total:              ~14-16 GB → 32 GB headroom on L20
 # ============================================================================
 
 # --- Model Architecture ---
@@ -54,8 +54,8 @@ training:
   warmup_steps: 2000
 
   # Batching
-  batch_size: 8               # micro batch (per forward pass)
-  gradient_accumulation_steps: 4  # effective batch = 8 × 4 = 32 sequences
+  batch_size: 4               # micro batch (per forward pass) — reduced from 8 to avoid OOM on L20
+  gradient_accumulation_steps: 8  # effective batch = 4 × 8 = 32 sequences (same effective batch)
   # effective tokens/step = 32 × 2048 = 65,536
 
   # Precision
@@ -63,7 +63,7 @@ training:
   compile_model: true         # torch.compile for kernel fusion
 
   # Gradient checkpointing (trades compute for memory)
-  gradient_checkpointing: false  # enable if VRAM is tight
+  gradient_checkpointing: true   # enabled to prevent OOM on 1.3B model
 
   # Logging
   log_interval: 10            # log every N steps
@@ -72,7 +72,7 @@ training:
   save_interval: 2000         # checkpoint every N steps
 
   # Checkpointing
-  checkpoint_dir: "./checkpoints/bitnet-1.3B"
+  checkpoint_dir: "./checkpoints/bitnet-1.3B-v2"   # fresh dir to avoid size mismatch with old ckpts
   keep_last_n_checkpoints: 2  # keep only 2 most recent step checkpoints
   auto_resume: true             # auto-find & resume from latest checkpoint
   resume_from: ""             # path to checkpoint (empty = auto-detect)
@@ -87,7 +87,7 @@ training:
     train_data_path: "./data/train.bin"
     val_data_path: "./data/val.bin"
     seq_length: 2048
-    batch_size: 8
+    batch_size: 4                   # must match training.batch_size
     num_workers: 4
     pin_memory: true
     seed: 42

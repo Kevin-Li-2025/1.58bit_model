@@ -228,6 +228,11 @@ class Trainer:
         if trainer_config.use_wandb:
             self._init_wandb()
 
+        # Ensure critical directories exist (prevents silent nohup failures
+        # when directories are accidentally deleted by e.g. rsync --delete)
+        for d in [trainer_config.checkpoint_dir, "./logs"]:
+            os.makedirs(d, exist_ok=True)
+
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """
         Create AdamW optimizer with weight decay only on 2D parameters.
@@ -641,16 +646,52 @@ class Trainer:
         return None
 
     def _load_checkpoint(self, path: str) -> None:
-        """Load training checkpoint and resume."""
+        """Load training checkpoint and resume.
+
+        Validates that the checkpoint's model architecture matches the
+        current config before loading.  This prevents 'size mismatch'
+        crashes when old checkpoints from a different model size are
+        left in the checkpoint directory.
+        """
         logger.info("Loading checkpoint from %s...", path)
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+        # ── Guard: validate model config compatibility ──────────────
+        saved_cfg = checkpoint.get("model_config", {})
+        if saved_cfg:
+            mismatches = []
+            for key in ("hidden_size", "num_layers", "num_heads", "vocab_size"):
+                saved_val = saved_cfg.get(key)
+                current_val = getattr(self.model_config, key, None)
+                if saved_val is not None and current_val is not None and saved_val != current_val:
+                    mismatches.append(f"{key}: saved={saved_val} vs current={current_val}")
+
+            if mismatches:
+                logger.warning(
+                    "⚠️  Checkpoint config mismatch — skipping incompatible checkpoint!\n"
+                    "    Path: %s\n    Mismatches: %s\n"
+                    "    This usually means old checkpoints from a different model size "
+                    "were left in the checkpoint directory.  Delete them or change "
+                    "checkpoint_dir to start fresh.",
+                    path, "; ".join(mismatches),
+                )
+                return  # Skip loading — start fresh instead of crashing
 
         # Get the base model (unwrap torch.compile if needed)
         model = self.model
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
 
-        model.load_state_dict(checkpoint["model_state_dict"])
+        try:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        except RuntimeError as e:
+            logger.warning(
+                "⚠️  Failed to load model state_dict (likely size mismatch): %s\n"
+                "    Skipping this checkpoint — training will start from scratch.",
+                e,
+            )
+            return
+
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         self.global_step = checkpoint.get("global_step", 0)
