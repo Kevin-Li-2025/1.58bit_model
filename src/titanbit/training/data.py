@@ -814,7 +814,7 @@ def _create_hf_loaders(config: DataConfig) -> tuple[DataLoader, Optional[DataLoa
         train_ds,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
+        pin_memory=config.pin_memory and torch.cuda.is_available(),
         drop_last=True,
     )
 
@@ -835,7 +835,7 @@ def _create_hf_loaders(config: DataConfig) -> tuple[DataLoader, Optional[DataLoa
             val_ds,
             batch_size=config.batch_size,
             num_workers=min(2, config.num_workers),
-            pin_memory=config.pin_memory,
+            pin_memory=config.pin_memory and torch.cuda.is_available(),
             drop_last=False,
         )
 
@@ -854,7 +854,7 @@ def _create_mmap_loaders(config: DataConfig) -> tuple[DataLoader, Optional[DataL
         train_ds,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
+        pin_memory=config.pin_memory and torch.cuda.is_available(),
         drop_last=True,
     )
 
@@ -868,7 +868,7 @@ def _create_mmap_loaders(config: DataConfig) -> tuple[DataLoader, Optional[DataL
             val_ds,
             batch_size=config.batch_size,
             num_workers=min(2, config.num_workers),
-            pin_memory=config.pin_memory,
+            pin_memory=config.pin_memory and torch.cuda.is_available(),
             shuffle=False,
             drop_last=False,
         )

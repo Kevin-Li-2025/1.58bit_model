@@ -303,5 +303,5 @@ def count_ternary_params(model: nn.Module) -> dict[str, int]:
 def getattr_nested(obj: object, name: str) -> object:
     """Get a nested attribute by dot-separated name."""
     for part in name.split("."):
-        obj = getattr(obj, part, obj)
+        obj = getattr(obj, part)
     return obj

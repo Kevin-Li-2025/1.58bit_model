@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 from titanbit.model.config import BitNetConfig
 from titanbit.model.transformer import BitNetTransformer
@@ -210,7 +210,7 @@ class Trainer:
         self.train_loader, self.val_loader = create_data_loaders(trainer_config.data)
 
         # AMP
-        self.scaler = GradScaler() if self.dtype == torch.float16 else None
+        self.scaler = GradScaler(device=self.device.type) if self.dtype == torch.float16 else None
         self.amp_ctx = torch.amp.autocast(
             device_type=self.device.type,
             dtype=self.dtype,

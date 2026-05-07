@@ -108,7 +108,8 @@ def unpack_ternary_weights(packed: torch.Tensor, in_features: int) -> torch.Tens
         bits = (packed >> (i * 2)) & 0x3
         # Decode: 0 → 0, 1 → 1, 2 → -1
         vals = torch.where(bits == 2, torch.tensor(-1.0, device=packed.device), bits.float())
-        unpacked[:, i::16] = vals
+        # Write contiguously: element i within each group of 16
+        unpacked[:, torch.arange(packed_cols, device=packed.device) * 16 + i] = vals
 
     return unpacked[:, :in_features]
 

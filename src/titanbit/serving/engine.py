@@ -324,7 +324,13 @@ class InferenceEngine:
         gen_config: GenerationConfig | None = None,
     ) -> torch.Tensor:
         """
-        Generate tokens autoregressively.
+        Generate tokens autoregressively with KV cache.
+
+        Uses a two-phase approach:
+            1. Prefill: process entire prompt, cache K/V states
+            2. Decode: process one token at a time using cached K/V
+
+        This gives O(n·L) generation instead of the naive O(n²·L).
 
         Parameters
         ----------
@@ -344,9 +350,18 @@ class InferenceEngine:
 
         start_time = time.monotonic()
 
-        # Prefill: process the entire prompt
-        logits, _ = self.model(input_ids)
+        # Phase 1: Prefill — process the entire prompt, collect KV cache
+        use_kv = gen_config.use_cache
+        logits, _ = self.model(input_ids, use_cache=use_kv)
         next_logits = logits[:, -1, :]
+
+        # Collect past_kv from the model layers for cached decoding
+        past_kv = None
+        if use_kv:
+            # Re-run with use_cache=True to collect KV pairs
+            # The model returns logits but KV must be collected via
+            # a forward that returns them.  We restructure to collect.
+            past_kv = self._collect_kv_cache(input_ids)
 
         for step in range(gen_config.max_new_tokens):
             # Sample next token
@@ -365,8 +380,21 @@ class InferenceEngine:
                 if (next_token == gen_config.eos_token_id).all():
                     break
 
-            # Forward pass for next position (single token)
-            logits, _ = self.model(generated)
+            # Phase 2: Decode — single token with KV cache
+            if past_kv is not None:
+                # Process only the new token
+                logits, _ = self.model(
+                    next_token.unsqueeze(-1),
+                    use_cache=True,
+                    past_kv=past_kv,
+                )
+                # Update KV cache with new entries
+                past_kv = self._collect_kv_cache_incremental(
+                    next_token.unsqueeze(-1), past_kv
+                )
+            else:
+                # Fallback: re-process entire sequence (no cache)
+                logits, _ = self.model(generated)
             next_logits = logits[:, -1, :]
 
         elapsed = time.monotonic() - start_time
@@ -382,6 +410,40 @@ class InferenceEngine:
 
         return generated
 
+    def _collect_kv_cache(
+        self,
+        input_ids: torch.Tensor,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Run a forward pass with use_cache=True and collect KV pairs per layer."""
+        model = self.model
+        x = model.embed_tokens(input_ids)
+        x = model.embed_dropout(x)
+
+        past_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer in model.layers:
+            x, new_kv = layer(x, use_cache=True)
+            if new_kv is not None:
+                past_kv.append(new_kv)
+        return past_kv
+
+    def _collect_kv_cache_incremental(
+        self,
+        new_token_ids: torch.Tensor,
+        past_kv: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Run a single-token forward with existing KV cache, return updated cache."""
+        model = self.model
+        x = model.embed_tokens(new_token_ids)
+        x = model.embed_dropout(x)
+
+        updated_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for i, layer in enumerate(model.layers):
+            layer_past = past_kv[i] if i < len(past_kv) else None
+            x, new_kv = layer(x, use_cache=True, past_kv=layer_past)
+            if new_kv is not None:
+                updated_kv.append(new_kv)
+        return updated_kv
+
     @torch.no_grad()
     def generate_stream(
         self,
@@ -389,7 +451,7 @@ class InferenceEngine:
         gen_config: GenerationConfig | None = None,
     ) -> Generator[int, None, None]:
         """
-        Stream tokens one at a time.
+        Stream tokens one at a time with KV cache.
 
         Yields individual token IDs as they are generated.
         This is useful for real-time chat interfaces.
@@ -408,9 +470,12 @@ class InferenceEngine:
 
         generated = input_ids.clone()
 
-        # Prefill
+        # Prefill with KV cache
+        use_kv = gen_config.use_cache
         logits, _ = self.model(input_ids)
         next_logits = logits[:, -1, :]
+
+        past_kv = self._collect_kv_cache(input_ids) if use_kv else None
 
         for step in range(gen_config.max_new_tokens):
             next_token = self.sampler.sample(
@@ -424,7 +489,16 @@ class InferenceEngine:
                 break
 
             generated = torch.cat([generated, next_token.unsqueeze(-1)], dim=-1)
-            logits, _ = self.model(generated)
+
+            if past_kv is not None:
+                logits, _ = self.model(
+                    next_token.unsqueeze(-1), use_cache=True, past_kv=past_kv
+                )
+                past_kv = self._collect_kv_cache_incremental(
+                    next_token.unsqueeze(-1), past_kv
+                )
+            else:
+                logits, _ = self.model(generated)
             next_logits = logits[:, -1, :]
 
     @property
